@@ -3170,23 +3170,58 @@ class ForwarderBot(CacheObserver):
             logger.info("Бот не запущен, игнорирую сообщение")
 
     async def handle_chat_member(self, update: types.ChatMemberUpdated):
-        """Handler for bot being added/removed from chats"""
+        """Handler for bot being added/removed from chats with detailed chat information"""
         if update.new_chat_member.user.id != self.bot.id:
             return
 
         chat_id = update.chat.id
         is_member = update.new_chat_member.status in ['member', 'administrator']
         
+        # Получаем подробную информацию о чате
+        chat_info = f"чат {chat_id}"
+        try:
+            chat_title = update.chat.title or "Без названия"
+            chat_type = update.chat.type
+            chat_username = f"@{update.chat.username}" if update.chat.username else "приватный"
+            
+            # Формируем красивое описание чата
+            if chat_type == 'private':
+                chat_info = f"личный чат с {chat_title} ({chat_username})"
+            elif chat_type == 'group':
+                chat_info = f"группу '{chat_title}' ({chat_username}, ID: {chat_id})"
+            elif chat_type == 'supergroup':
+                chat_info = f"супергруппу '{chat_title}' ({chat_username}, ID: {chat_id})"
+            elif chat_type == 'channel':
+                chat_info = f"канал '{chat_title}' ({chat_username}, ID: {chat_id})"
+            else:
+                chat_info = f"чат '{chat_title}' (тип: {chat_type}, {chat_username}, ID: {chat_id})"
+                
+            # Дополнительная информация о участниках (если доступно)
+            try:
+                member_count = await self.bot.get_chat_member_count(chat_id)
+                chat_info += f", участников: {member_count}"
+            except Exception:
+                pass  # Игнорируем ошибки получения количества участников
+                
+        except Exception as e:
+            logger.warning(f"Не удалось получить информацию о чате {chat_id}: {e}")
+            chat_info = f"чат ID: {chat_id}"
+        
         if is_member and update.chat.type in ['group', 'supergroup']:
             await Repository.add_target_chat(chat_id)
             self.cache_service.remove_from_cache(chat_id)
-            await self._notify_admins(f"Бот добавлен в {update.chat.type}: {update.chat.title} ({chat_id})")
-            logger.info(f"Бот добавлен в {update.chat.type}: {update.chat.title} ({chat_id})")
+            
+            message = f"✅ Бот добавлен в {chat_info}"
+            await self._notify_admins(message)
+            logger.info(f"Бот добавлен в {chat_info}")
+            
         elif not is_member:
             await Repository.remove_target_chat(chat_id)
             self.cache_service.remove_from_cache(chat_id)
-            await self._notify_admins(f"Бот удален из чата {chat_id}")
-            logger.info(f"Бот удален из чата {chat_id}")
+            
+            message = f"❌ Бот удален из {chat_info}"
+            await self._notify_admins(message)
+            logger.info(f"Бот удален из {chat_info}")
 
     async def _notify_owner(self, message: str):
         """Send notification to bot owner (first admin for compatibility)"""
