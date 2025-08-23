@@ -69,7 +69,7 @@ class Repository:
     
     @staticmethod
     async def init_db() -> None:
-        """Initialize database schema"""
+        """Initialize database schema with new tables"""
         async with DatabaseConnectionPool.get_connection() as db:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS config (
@@ -93,15 +93,338 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS channel_intervals (
                     channel_id TEXT PRIMARY KEY,
                     next_channel_id TEXT,
-                    interval_seconds INTEGER DEFAULT 900,  /* 15 минут по умолчанию */
+                    interval_seconds INTEGER DEFAULT 900,
                     FOREIGN KEY(channel_id) REFERENCES last_messages(channel_id) ON DELETE CASCADE,
                     FOREIGN KEY(next_channel_id) REFERENCES last_messages(channel_id) ON DELETE SET NULL
                 );
+                CREATE TABLE IF NOT EXISTS bot_clones (
+                    bot_id TEXT PRIMARY KEY,
+                    bot_token TEXT,
+                    bot_username TEXT,
+                    status TEXT DEFAULT 'inactive',
+                    pid INTEGER,
+                    started_at TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    config_data TEXT,
+                    notes TEXT
+                );
+                CREATE TABLE IF NOT EXISTS channel_test_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT,
+                    test_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT,
+                    message_id INTEGER,
+                    error_message TEXT,
+                    test_duration_ms INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS admin_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    action TEXT,
+                    user_id INTEGER,
+                    target TEXT,
+                    status TEXT,
+                    details TEXT,
+                    initiated_by INTEGER,
+                    batch_id TEXT
+                );
+                -- Ensure admin_operations table exists for history/stats queries
+                CREATE TABLE IF NOT EXISTS admin_operations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_type TEXT,
+                    target_user_id INTEGER,
+                    target_channel_id TEXT,
+                    status TEXT,
+                    error_message TEXT,
+                    performed_by INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE INDEX IF NOT EXISTS idx_forward_stats_timestamp ON forward_stats(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_target_chats_added_at ON target_chats(added_at);
+                CREATE INDEX IF NOT EXISTS idx_channel_test_results_timestamp ON channel_test_results(test_timestamp);
+                CREATE INDEX IF NOT EXISTS idx_admin_log_timestamp ON admin_log(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_admin_log_batch_id ON admin_log(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_bot_clones_status ON bot_clones(status);
             """)
+            
+            # Apply lightweight migrations for existing databases
+            try:
+                async with db.execute("PRAGMA table_info('bot_clones')") as cursor:
+                    columns_info = await cursor.fetchall()
+                    existing_columns = {row[1] for row in columns_info}
+
+                # Add missing columns one by one (SQLite supports ADD COLUMN)
+                if 'bot_username' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN bot_username TEXT")
+                if 'status' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN status TEXT DEFAULT 'inactive'")
+                if 'pid' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN pid INTEGER")
+                if 'started_at' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN started_at TIMESTAMP")
+                if 'last_seen' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                if 'config_data' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN config_data TEXT")
+                if 'notes' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN notes TEXT")
+            except Exception as e:
+                # Log but don't fail initialization
+                logger.error(f"DB migration error: {e}")
             await db.commit()
 
+    @staticmethod
+    async def save_bot_clone(bot_id: str, bot_token: str, bot_username: str, status: str = 'inactive', 
+                            pid: int = None, config_data: str = None, notes: str = None) -> None:
+        """Save or update bot clone information"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            # Defensive migration in case init_db wasn't called earlier
+            try:
+                async with db.execute("PRAGMA table_info('bot_clones')") as cursor:
+                    columns_info = await cursor.fetchall()
+                    existing_columns = {row[1] for row in columns_info}
+                if 'started_at' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN started_at TIMESTAMP")
+                if 'last_seen' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+                if 'config_data' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN config_data TEXT")
+                if 'notes' not in existing_columns:
+                    await db.execute("ALTER TABLE bot_clones ADD COLUMN notes TEXT")
+            except Exception as e:
+                logger.warning(f"Deferred migration during save_bot_clone: {e}")
+            await db.execute("""
+                INSERT INTO bot_clones 
+                (bot_id, bot_token, bot_username, status, pid, started_at, last_seen, config_data, notes)
+                VALUES (
+                    ?, ?, ?, ?, ?, 
+                    CASE WHEN ? = 'active' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    CURRENT_TIMESTAMP, ?, ?
+                )
+                ON CONFLICT(bot_id) DO UPDATE SET
+                    bot_token = excluded.bot_token,
+                    bot_username = excluded.bot_username,
+                    status = excluded.status,
+                    pid = excluded.pid,
+                    started_at = CASE 
+                        WHEN excluded.status = 'active' THEN CURRENT_TIMESTAMP 
+                        ELSE bot_clones.started_at 
+                    END,
+                    last_seen = CURRENT_TIMESTAMP,
+                    config_data = excluded.config_data,
+                    notes = excluded.notes
+            """, (bot_id, bot_token, bot_username, status, pid, status, config_data, notes))
+            await db.commit()
+
+
+    @staticmethod
+    async def update_clone_status(bot_id: str, status: str, pid: int = None, notes: str = None) -> None:
+        """Update clone status"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            if pid is not None:
+                await db.execute("""
+                    UPDATE bot_clones 
+                    SET status = ?, pid = ?, last_seen = CURRENT_TIMESTAMP, notes = ?
+                    WHERE bot_id = ?
+                """, (status, pid, notes, bot_id))
+            else:
+                await db.execute("""
+                    UPDATE bot_clones 
+                    SET status = ?, last_seen = CURRENT_TIMESTAMP, notes = ?
+                    WHERE bot_id = ?
+                """, (status, notes, bot_id))
+            await db.commit()
+
+    @staticmethod
+    async def remove_bot_clone(bot_id: str) -> None:
+        """Remove bot clone from database"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            await db.execute("DELETE FROM bot_clones WHERE bot_id = ?", (bot_id,))
+            await db.commit()
+
+    # Методы для результатов тестирования каналов
+    @staticmethod
+    async def save_channel_test_result(channel_id: str, status: str, message_id: int = None, 
+                                    error_message: str = None, test_duration_ms: int = None) -> None:
+        """Save channel test result"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            await db.execute("""
+                INSERT INTO channel_test_results 
+                (channel_id, status, message_id, error_message, test_duration_ms)
+                VALUES (?, ?, ?, ?, ?)
+            """, (channel_id, status, message_id, error_message, test_duration_ms))
+            await db.commit()
+
+    @staticmethod
+    async def get_channel_test_history(channel_id: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get channel test history"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            if channel_id:
+                query = """
+                    SELECT channel_id, test_timestamp, status, message_id, error_message, test_duration_ms
+                    FROM channel_test_results 
+                    WHERE channel_id = ?
+                    ORDER BY test_timestamp DESC LIMIT ?
+                """
+                params = (channel_id, limit)
+            else:
+                query = """
+                    SELECT channel_id, test_timestamp, status, message_id, error_message, test_duration_ms
+                    FROM channel_test_results 
+                    ORDER BY test_timestamp DESC LIMIT ?
+                """
+                params = (limit,)
+            
+            async with db.execute(query, params) as cursor:
+                results = await cursor.fetchall()
+                return [
+                    {
+                        'channel_id': row[0],
+                        'test_timestamp': row[1],
+                        'status': row[2],
+                        'message_id': row[3],
+                        'error_message': row[4],
+                        'test_duration_ms': row[5]
+                    }
+                    for row in results
+                ]
+
+    # Методы для операций с администраторами
+    @staticmethod
+    async def log_admin_operation(action: str, user_id: int, target: str, status: str, details: str, initiated_by: int, batch_id: str = None) -> str:
+        """Log an admin operation and return the operation ID."""
+        async with DatabaseConnectionPool.get_connection() as conn:
+            cursor = await conn.execute(
+                "INSERT INTO admin_log (action, user_id, target, status, details, initiated_by, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (action, user_id, target, status, details, initiated_by, batch_id)
+            )
+            await conn.commit()
+            operation_id = str(cursor.lastrowid)
+            await cursor.close()
+            return operation_id
+
+    @staticmethod
+    async def get_admin_history(limit: int = 50):
+        """Fetch admin operation history"""
+        async with DatabaseConnectionPool.get_connection() as conn:
+            cursor = await conn.execute("SELECT id, timestamp, action, user_id, target, status, details, initiated_by FROM admin_log ORDER BY timestamp DESC LIMIT ?", (limit,))
+            logs = await cursor.fetchall()
+            await cursor.close()
+            return logs
+
+    @staticmethod
+    async def get_admin_operations_history(limit: int = 50) -> List[Dict[str, Any]]:
+        """Get admin operations history"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            async with db.execute("""
+                SELECT operation_type, target_user_id, target_channel_id, status, error_message, performed_by, timestamp
+                FROM admin_operations 
+                ORDER BY timestamp DESC LIMIT ?
+            """, (limit,)) as cursor:
+                results = await cursor.fetchall()
+                return [
+                    {
+                        'operation_type': row[0],
+                        'target_user_id': row[1],
+                        'target_channel_id': row[2],
+                        'status': row[3],
+                        'error_message': row[4],
+                        'performed_by': row[5],
+                        'timestamp': row[6]
+                    }
+                    for row in results
+                ]
+
+    @staticmethod
+    async def get_batch_operation_details(batch_id: str):
+        """Fetch all logs for a specific batch operation."""
+        async with DatabaseConnectionPool.get_connection() as conn:
+            cursor = await conn.execute(
+                "SELECT id, timestamp, action, user_id, target, status, details, initiated_by FROM admin_log WHERE batch_id = ? ORDER BY id",
+                (batch_id,)
+            )
+            logs = await cursor.fetchall()
+            await cursor.close()
+            return logs
+
+    # Методы для получения статистики
+    @staticmethod
+    async def get_enhanced_stats() -> Dict[str, Any]:
+        """Get enhanced statistics including clones and tests"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            stats = {}
+            
+            # Базовая статистика пересылок
+            async with db.execute("SELECT COUNT(*) FROM forward_stats") as cursor:
+                stats['total_forwards'] = (await cursor.fetchone())[0]
+
+            async with db.execute(
+                "SELECT timestamp FROM forward_stats ORDER BY timestamp DESC LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+                stats['last_forward'] = row[0] if row else None
+
+            # Статистика клонов
+            async with db.execute("SELECT COUNT(*) FROM bot_clones") as cursor:
+                stats['total_clones'] = (await cursor.fetchone())[0]
+                
+            async with db.execute("SELECT COUNT(*) FROM bot_clones WHERE status = 'active'") as cursor:
+                stats['active_clones'] = (await cursor.fetchone())[0]
+
+            # Статистика тестов каналов
+            async with db.execute("SELECT COUNT(*) FROM channel_test_results") as cursor:
+                stats['total_tests'] = (await cursor.fetchone())[0]
+                
+            async with db.execute("""
+                SELECT COUNT(*) FROM channel_test_results 
+                WHERE status = 'success' AND test_timestamp > datetime('now', '-24 hours')
+            """) as cursor:
+                stats['successful_tests_24h'] = (await cursor.fetchone())[0]
+
+            # Последние операции админов
+            async with db.execute("SELECT COUNT(*) FROM admin_operations") as cursor:
+                stats['total_admin_operations'] = (await cursor.fetchone())[0]
+                
+            async with db.execute("""
+                SELECT COUNT(*) FROM admin_operations 
+                WHERE status = 'success' AND timestamp > datetime('now', '-24 hours')
+            """) as cursor:
+                stats['successful_admin_ops_24h'] = (await cursor.fetchone())[0]
+
+            # Последние сообщения по каналам
+            async with db.execute(
+                "SELECT channel_id, message_id, timestamp FROM last_messages"
+            ) as cursor:
+                results = await cursor.fetchall()
+                stats['last_messages'] = {
+                    row[0]: {"message_id": row[1], "timestamp": row[2]}
+                    for row in results
+                }
+
+            return stats
+    @staticmethod
+    async def get_bot_clones() -> List[Dict[str, Any]]:
+        """Get all bot clones"""
+        async with DatabaseConnectionPool.get_connection() as db:
+            async with db.execute("""
+                SELECT bot_id, bot_token, bot_username, status, pid, started_at, last_seen, config_data, notes
+                FROM bot_clones ORDER BY last_seen DESC
+            """) as cursor:
+                results = await cursor.fetchall()
+                return [
+                    {
+                        'bot_id': row[0],
+                        'bot_token': row[1],
+                        'bot_username': row[2],
+                        'status': row[3],
+                        'pid': row[4],
+                        'started_at': row[5],
+                        'last_seen': row[6],
+                        'config_data': row[7],
+                        'notes': row[8]
+                    }
+                    for row in results
+                ]
     # Add to Repository class
     @staticmethod
     async def set_channel_interval(channel1: str, channel2: str, interval_seconds: int) -> None:

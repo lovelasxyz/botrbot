@@ -20,6 +20,8 @@ class KeyboardFactory:
         kb.button(text="📊 Показать статистику", callback_data="stats")
         kb.button(text="⚙️ Управление каналами", callback_data="channels")
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
+        kb.button(text="🧪 Тест каналов", callback_data="test_channels")  # Новая кнопка
+        kb.button(text="👥 Добавить админа", callback_data="add_user_admin")  # Новая кнопка
         kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")
         kb.button(text="👥 Управление клонами", callback_data="manage_clones")
         kb.adjust(2)
@@ -172,7 +174,7 @@ class KeyboardFactory:
 
     @staticmethod
     def create_channel_management_keyboard(channels: List[str]) -> Any:
-        """Create simplified channel management keyboard"""
+        """Create enhanced channel management keyboard"""
         kb = InlineKeyboardBuilder()
         
         # Основные действия
@@ -180,15 +182,66 @@ class KeyboardFactory:
         
         if channels:
             kb.button(text="❌ Удалить канал", callback_data="remove_channel_menu")
+            kb.button(text="🧪 Тест каналов", callback_data="test_channels")  # Новая кнопка
             kb.button(text="↕️ Изменить порядок", callback_data="reorder_channels")
         
         if len(channels) >= 2:
             kb.button(text="⏱️ Интервалы между каналами", callback_data="channel_intervals")
         
         kb.button(text="🔙 Назад", callback_data="back_to_main")
-        kb.adjust(2, 1, 1, 1)  # 2 кнопки в первом ряду, остальные по одной
+        
+        # Новая раскладка для дополнительной кнопки
+        if channels:
+            if len(channels) >= 2:
+                kb.adjust(2, 2, 1, 1, 1)  # 2+2+1+1+1
+            else:
+                kb.adjust(2, 2, 1, 1)  # 2+2+1+1
+        else:
+            kb.adjust(1, 1)  # 1+1
+        
         return kb.as_markup()
-
+    
+    @staticmethod 
+    def create_clone_management_keyboard_with_recovery(bots: dict) -> Any:
+        """Create clone management keyboard showing recovered clones"""
+        kb = InlineKeyboardBuilder()
+        
+        clone_count = len([b for b in bots if b != "main"])
+        
+        if clone_count == 0:
+            kb.button(text="Добавить клон", callback_data="clone_bot")
+            kb.button(text="Назад", callback_data="back_to_main")
+            kb.adjust(2)
+        else:
+            # Показываем информацию о клонах с учетом восстановленных
+            for bot_id, info in bots.items():
+                if bot_id == "main":
+                    continue
+                    
+                bot_username = bot_id.replace("bot_", "@")
+                
+                # Определяем статус
+                if 'note' in info and 'восстановлен' in info['note'].lower():
+                    status = "🔄 Восстановлен"
+                    action_text = f"Проверить {bot_username}"
+                    action_callback = f"check_clone_{bot_id}"
+                elif info.get('status') == 'running':
+                    status = "🟢 Работает"
+                    action_text = f"Остановить {bot_username}"
+                    action_callback = f"stop_clone_{bot_id}"
+                else:
+                    status = "🔴 Остановлен"
+                    action_text = f"Запустить {bot_username}"
+                    action_callback = f"start_clone_{bot_id}"
+                
+                kb.button(text=action_text, callback_data=action_callback)
+            
+            kb.button(text="Добавить клон", callback_data="clone_bot")
+            kb.button(text="Назад", callback_data="back_to_main")
+            kb.adjust(1)
+        
+        return kb.as_markup()
+    
     @staticmethod 
     def create_channel_removal_keyboard(channels: List[str], page: int = 0, channel_info: Dict[str, str] = None, per_page: int = 5) -> Any:
         """Create keyboard for channel removal with pagination and real channel names"""

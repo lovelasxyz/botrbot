@@ -47,7 +47,10 @@ class Config:
         if initial_source:
             self.source_channels.append(initial_source)
             
-        self.db_path: str = os.getenv("DB_PATH", "forwarder.db")
+        # Resolve database path to absolute to avoid per-process relative CWD issues
+        db_env_path = os.getenv("DB_PATH", "forwarder.db")
+        self.db_path: str = os.path.abspath(os.path.expanduser(db_env_path))
+        logger.info(f"Using database file: {self.db_path}")
         
         # Try to load additional source channels from config file
         self._load_channels_from_config()
@@ -65,6 +68,18 @@ class Config:
         
         self._initialized = True
     
+    def save_config(self):
+        """Save current configuration to bot_config.json"""
+        try:
+            with open('bot_config.json', 'w') as f:
+                config_data = {
+                    'source_channels': self.source_channels,
+                    'admin_ids': self.admin_ids
+                }
+                json.dump(config_data, f, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to save config: {e}")
+
     def is_admin(self, user_id: int) -> bool:
         """Check if user is an admin"""
         return user_id in self.admin_ids
