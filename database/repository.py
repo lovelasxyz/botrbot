@@ -73,8 +73,10 @@ class Repository:
         async with DatabaseConnectionPool.get_connection() as db:
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS config (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
+                    bot_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT,
+                    PRIMARY KEY (bot_id, key)
                 );
                 CREATE TABLE IF NOT EXISTS target_chats (
                     chat_id INTEGER PRIMARY KEY,
@@ -91,11 +93,11 @@ class Repository:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS channel_intervals (
-                    channel_id TEXT PRIMARY KEY,
+                    bot_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
                     next_channel_id TEXT,
                     interval_seconds INTEGER DEFAULT 900,
-                    FOREIGN KEY(channel_id) REFERENCES last_messages(channel_id) ON DELETE CASCADE,
-                    FOREIGN KEY(next_channel_id) REFERENCES last_messages(channel_id) ON DELETE SET NULL
+                    PRIMARY KEY (bot_id, channel_id)
                 );
                 CREATE TABLE IF NOT EXISTS bot_clones (
                     bot_id TEXT PRIMARY KEY,
@@ -171,6 +173,56 @@ class Repository:
             except Exception as e:
                 # Log but don't fail initialization
                 logger.error(f"DB migration error: {e}")
+
+            # Ensure config table supports per-bot keys
+            try:
+                async with db.execute("PRAGMA table_info('config')") as cursor:
+                    config_columns_info = await cursor.fetchall()
+                    config_columns = {row[1] for row in config_columns_info}
+
+                if 'bot_id' not in config_columns:
+                    await db.execute("""
+                        CREATE TABLE IF NOT EXISTS config_v2 (
+                            bot_id TEXT NOT NULL,
+                            key TEXT NOT NULL,
+                            value TEXT,
+                            PRIMARY KEY (bot_id, key)
+                        )
+                    """)
+                    await db.execute(
+                        "INSERT OR IGNORE INTO config_v2 (bot_id, key, value) SELECT 'main', key, value FROM config"
+                    )
+                    await db.execute("DROP TABLE config")
+                    await db.execute("ALTER TABLE config_v2 RENAME TO config")
+            except Exception as e:
+                logger.error(f"Config table migration error: {e}")
+
+            # Ensure channel_intervals table supports per-bot values
+            try:
+                async with db.execute("PRAGMA table_info('channel_intervals')") as cursor:
+                    interval_columns_info = await cursor.fetchall()
+                    interval_columns = {row[1] for row in interval_columns_info}
+
+                if 'bot_id' not in interval_columns:
+                    await db.execute("""
+                        CREATE TABLE IF NOT EXISTS channel_intervals_v2 (
+                            bot_id TEXT NOT NULL,
+                            channel_id TEXT NOT NULL,
+                            next_channel_id TEXT,
+                            interval_seconds INTEGER DEFAULT 900,
+                            PRIMARY KEY (bot_id, channel_id)
+                        )
+                    """)
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO channel_intervals_v2 (bot_id, channel_id, next_channel_id, interval_seconds)
+                        SELECT 'main', channel_id, next_channel_id, interval_seconds FROM channel_intervals
+                        """
+                    )
+                    await db.execute("DROP TABLE channel_intervals")
+                    await db.execute("ALTER TABLE channel_intervals_v2 RENAME TO channel_intervals")
+            except Exception as e:
+                logger.error(f"Channel intervals migration error: {e}")
             await db.commit()
 
     @staticmethod
@@ -427,40 +479,42 @@ class Repository:
                 ]
     # Add to Repository class
     @staticmethod
-    async def set_channel_interval(channel1: str, channel2: str, interval_seconds: int) -> None:
+    async def set_channel_interval(channel1: str, channel2: str, interval_seconds: int, bot_id: str) -> None:
         """Set interval between two channels"""
-        # You can store this in a dedicated table or as a config entry
-        # Example using config table with a compound key
         key = f"channel_interval_{channel1}_{channel2}"
-        await Repository.set_config(key, str(interval_seconds))
+        await Repository.set_config(key, str(interval_seconds), bot_id)
         async with DatabaseConnectionPool.get_connection() as db:
             await db.execute(
                 """
-                INSERT OR REPLACE INTO channel_intervals 
-                (channel_id, next_channel_id, interval_seconds) 
-                VALUES (?, ?, ?)
+                INSERT INTO channel_intervals 
+                (bot_id, channel_id, next_channel_id, interval_seconds) 
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(bot_id, channel_id) DO UPDATE SET
+                    next_channel_id = excluded.next_channel_id,
+                    interval_seconds = excluded.interval_seconds
                 """,
-                (channel1, channel2, interval_seconds)
+                (bot_id, channel1, channel2, interval_seconds)
             )
             await db.commit()
 
     @staticmethod
-    async def get_channel_intervals() -> Dict[str, Dict[str, Any]]:
+    async def get_channel_intervals(bot_id: str) -> Dict[str, Dict[str, Any]]:
         """Get all channel intervals"""
         async with DatabaseConnectionPool.get_connection() as db:
             async with db.execute(
-                "SELECT channel_id, next_channel_id, interval_seconds FROM channel_intervals"
+                "SELECT channel_id, next_channel_id, interval_seconds FROM channel_intervals WHERE bot_id = ?",
+                (bot_id,)
             ) as cursor:
                 results = await cursor.fetchall()
                 return {row[0]: {"next_channel": row[1], "interval": row[2]} for row in results}
 
     @staticmethod
-    async def delete_channel_interval(channel_id: str) -> None:
+    async def delete_channel_interval(channel_id: str, bot_id: str) -> None:
         """Delete interval for a channel"""
         async with DatabaseConnectionPool.get_connection() as db:
             await db.execute(
-                "DELETE FROM channel_intervals WHERE channel_id = ?",
-                (channel_id,)
+                "DELETE FROM channel_intervals WHERE bot_id = ? AND channel_id = ?",
+                (bot_id, channel_id)
             )
             await db.commit()
             
@@ -492,23 +546,26 @@ class Repository:
             await db.commit()
 
     @staticmethod
-    async def get_config(key: str, default: Optional[str] = None) -> Optional[str]:
+    async def get_config(key: str, default: Optional[str] = None, bot_id: str = "main") -> Optional[str]:
         """Get configuration value"""
         async with DatabaseConnectionPool.get_connection() as db:
             async with db.execute(
-                "SELECT value FROM config WHERE key = ?",
-                (key,)
+                "SELECT value FROM config WHERE bot_id = ? AND key = ?",
+                (bot_id, key)
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else default
 
     @staticmethod
-    async def set_config(key: str, value: str) -> None:
+    async def set_config(key: str, value: str, bot_id: str = "main") -> None:
         """Set configuration value"""
         async with DatabaseConnectionPool.get_connection() as db:
             await db.execute(
-                "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-                (key, str(value))
+                """
+                INSERT INTO config (bot_id, key, value) VALUES (?, ?, ?)
+                ON CONFLICT(bot_id, key) DO UPDATE SET value = excluded.value
+                """,
+                (bot_id, key, str(value))
             )
             await db.commit()
 

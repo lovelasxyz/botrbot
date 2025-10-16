@@ -2,6 +2,17 @@ import os
 import sqlite3
 from contextlib import closing
 
+try:
+    from migrations.per_bot_schema import (
+        migrate_channel_intervals_to_per_bot,
+        migrate_config_to_per_bot,
+    )
+except ImportError:  # Fallback when executed as module
+    from database.migrations.per_bot_schema import (  # type: ignore
+        migrate_channel_intervals_to_per_bot,
+        migrate_config_to_per_bot,
+    )
+
 
 def get_db_path() -> str:
     """Resolve database file path without importing app config."""
@@ -75,6 +86,8 @@ def main() -> None:
         # in environments where autocommit may be enabled.
         ensure_table_admin_operations(conn)
         ensure_table_bot_clones_columns(conn)
+        migrate_config_to_per_bot(conn)
+        migrate_channel_intervals_to_per_bot(conn)
         ensure_indices(conn)
 
     print("Migrations completed successfully.")

@@ -5,7 +5,7 @@ class KeyboardFactory:
     """Factory Pattern implementation for creating keyboards"""
     
     @staticmethod
-    def create_main_keyboard(running: bool = False, auto_forward: bool = False) -> Any:
+    def create_main_keyboard(running: bool = False, auto_forward: bool = False, is_clone: bool = False) -> Any:
         """Create main menu keyboard"""
         kb = InlineKeyboardBuilder()
         kb.button(
@@ -22,8 +22,9 @@ class KeyboardFactory:
         kb.button(text="💬 Список целевых чатов", callback_data="list_chats")
         kb.button(text="🧪 Тест каналов", callback_data="test_channels")  # Новая кнопка
         kb.button(text="👥 Добавить админа", callback_data="add_user_admin")  # Новая кнопка
-        kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")
-        kb.button(text="👥 Управление клонами", callback_data="manage_clones")
+        if not is_clone:
+            kb.button(text="🤖 Клонировать бота", callback_data="clone_bot")
+            kb.button(text="👥 Управление клонами", callback_data="manage_clones")
         kb.adjust(2)
         return kb.as_markup()
 

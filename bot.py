@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import sys
+import hashlib
+import re
 from datetime import datetime
 import threading
 import importlib.util
@@ -121,8 +123,7 @@ async def run_bot_instance(bot_token: str, owner_id: int, source_channels: list,
     config.source_channels = source_channels
     
     # Create a new bot instance
-    bot_instance = ForwarderBot()
-    bot_instance.bot_id = bot_id  # Add identifier
+    bot_instance = ForwarderBot(bot_id=bot_id)
     
     try:
         await bot_instance.start()
@@ -135,15 +136,21 @@ async def run_bot_instance(bot_token: str, owner_id: int, source_channels: list,
 class ForwarderBot(CacheObserver):
     """Main bot class with Observer pattern implementation"""
     
-    def __init__(self):
+    def __init__(self, bot_id: str = "main"):
         self.config = Config()
+        self.bot_id = bot_id or "main"
+        self.config.set_bot_id(self.bot_id)
         self.bot = Bot(token=self.config.bot_token)
         self.dp = Dispatcher()
-        self.context = BotContext(self.bot, self.config)
+        self.context = BotContext(self.bot, self.config, bot_id=self.bot_id)
         self.cache_service = ChatCacheService()
         self.awaiting_channel_input = None  # Track if waiting for channel input
         self.bot_manager = BotManager()
-        self.bot_id = "main"  # Identifier for the main bot
+        self.is_clone = self.bot_id != "main"
+        self.admin_claim_command: Optional[str] = None
+        if self.is_clone:
+            self.admin_claim_command = self._generate_admin_claim_command()
+            logger.info(f"Admin claim command for clone {self.bot_id}: /{self.admin_claim_command}")
         self.child_bots = []  # Track spawned bots
         self._state_save_task = None
         self._start_state_save_task()
@@ -155,6 +162,54 @@ class ForwarderBot(CacheObserver):
     def is_admin(self, user_id: int) -> bool:
         """Check if user is an admin"""
         return self.config.is_admin(user_id)
+    
+    @staticmethod
+    def compute_admin_claim_command(bot_token: Optional[str], bot_id: str) -> str:
+        """Helper to derive admin claim command based on bot identity"""
+        seed = bot_token or bot_id or "clone"
+        digest = hashlib.sha256(seed.encode()).hexdigest()[:8]
+        return f"getadmin_{digest}"
+
+    def _generate_admin_claim_command(self) -> str:
+        """Create clone-specific admin claim command suffix"""
+        return self.compute_admin_claim_command(self.config.bot_token, self.bot_id)
+
+    async def handle_admin_claim_command(self, message: types.Message):
+        """Grant admin rights to the requester when using clone-specific command"""
+        if not self.is_clone or not self.admin_claim_command:
+            return
+
+        user_id = message.from_user.id
+        if self.config.is_admin(user_id):
+            await message.answer("ℹ️ Вы уже являетесь администратором этого бота.")
+            return
+
+        added = self.config.add_clone_admin(user_id)
+        if not added:
+            await message.answer("ℹ️ Вы уже являетесь администратором этого бота.")
+            return
+
+        await Repository.log_admin_operation(
+            'claim_admin',
+            user_id,
+            self.bot_id,
+            'success',
+            'Admin rights obtained via claim command',
+            user_id
+        )
+
+        await message.answer("✅ Вы получили права администратора в этом клоне. Используйте меню для управления ботом.")
+
+        notice = (
+            f"🔐 Пользователь {user_id} получил права администратора в клоне {self.bot_id}."
+        )
+        for admin_id in self.config.admin_ids:
+            if admin_id == user_id:
+                continue
+            try:
+                await self.bot.send_message(admin_id, notice)
+            except Exception as e:
+                logger.error(f"Не удалось уведомить администратора {admin_id}: {e}")
     
     def _start_state_save_task(self):
         """Запуск задачи периодического сохранения состояния"""
@@ -191,7 +246,8 @@ class ForwarderBot(CacheObserver):
             "После проверки токена вы сможете выбрать:\n"
             "• Запустить клон в текущем процессе\n"
             "• Создать файлы для отдельного запуска\n\n"
-            "Отправьте новый токен сообщением 💬",
+            "Можно отправить сразу несколько токенов, разделив их пробелами, запятыми или переводами строки.\n\n"
+            "Отправьте токен(ы) сообщением 💬",
             reply_markup=kb.as_markup()
         )
         await callback.answer()
@@ -793,117 +849,215 @@ class ForwarderBot(CacheObserver):
     # Обновите метод manage_clones для использования новой клавиатуры:
     async def manage_clones(self, callback: types.CallbackQuery):
         """Manage running bot clones with recovery support"""
-        if not self.is_admin(callback.from_user.id): 
+        if not self.is_admin(callback.from_user.id):
             return
-        
-        bots = self.bot_manager.list_bots()
-        
-        # Count clones (excluding main bot)
-        clone_count = len([b for b in bots if b != "main"])
-        
+
+        runtime_bots = self.bot_manager.list_bots()
+        try:
+            clones_from_db = await Repository.get_bot_clones()
+        except Exception as exc:
+            logger.error(f"Не удалось получить список клонов из БД: {exc}")
+            clones_from_db = []
+
+        clones_map = {}
+        clone_order = []
+        for clone in clones_from_db:
+            bot_id = clone.get("bot_id")
+            if not bot_id:
+                continue
+            clones_map[bot_id] = clone
+            if bot_id not in clone_order:
+                clone_order.append(bot_id)
+
+        for bot_id in runtime_bots.keys():
+            if bot_id == "main":
+                continue
+            if bot_id not in clone_order:
+                clone_order.append(bot_id)
+
+        clone_ids = [bot_id for bot_id in clone_order if bot_id != "main"]
+        clone_count = len(clone_ids)
+
         if clone_count == 0:
             kb = InlineKeyboardBuilder()
             kb.button(text="Добавить клон", callback_data="clone_bot")
             kb.button(text="Назад", callback_data="back_to_main")
             kb.adjust(2)
-            
+
             await callback.message.edit_text(
-                "📋 Нет запущенных клонов.\n\n"
+                "📋 Нет доступных клонов.\n\n"
                 "Добавьте новый клон для управления несколькими ботами.",
                 reply_markup=kb.as_markup()
             )
         else:
             text = "🤖 Управление ботами:\n\n"
             kb = InlineKeyboardBuilder()
-            
-            # Show main bot info first
-            main_info = bots.get("main", {})
-            text += f"• Основной бот\n  Статус: 🟢 Работает\n  PID: {main_info.get('pid', 'N/A')}\n\n"
-            
-            # Show clones with enhanced status
-            for bot_id, info in bots.items():
-                if bot_id == "main":
-                    continue
-                    
-                # Extract bot username from bot_id
-                bot_username = bot_id.replace("bot_", "@")
-                
-                # Determine status and appropriate action
-                if 'note' in info and 'восстановлен' in info.get('note', '').lower():
-                    status = "🔄 Восстановлен после перезапуска"
+
+            main_info = runtime_bots.get("main", {})
+            text += (
+                "• Основной бот\n"
+                f"  Статус: 🟢 Работает\n"
+                f"  PID: {main_info.get('pid', 'N/A')}\n\n"
+            )
+
+            for bot_id in clone_ids:
+                clone_db = clones_map.get(bot_id) or {}
+                runtime_info = runtime_bots.get(bot_id, {})
+                process = self.bot_manager.processes.get(bot_id)
+                note_text = runtime_info.get('note') or clone_db.get('notes')
+
+                bot_username = clone_db.get('bot_username') or bot_id.replace("bot_", "@")
+                if bot_username and not bot_username.startswith("@"):
+                    bot_username = f"@{bot_username}"
+
+                status_value = (runtime_info.get('status') or clone_db.get('status') or '').lower()
+                if note_text and 'восстановлен' in note_text.lower():
+                    status_text = "🔄 Восстановлен после перезапуска"
                     action_text = f"Проверить {bot_username}"
                     action_callback = f"check_clone_{bot_id}"
-                elif 'note' in info and 'переподключен' in info.get('note', '').lower():
-                    status = "🔗 Переподключен"
+                elif note_text and 'переподключен' in note_text.lower():
+                    status_text = "🔗 Переподключен"
                     action_text = f"Остановить {bot_username}"
                     action_callback = f"force_stop_clone_{bot_id}"
+                elif process and process.is_alive():
+                    status_text = "🟢 Работает"
+                    action_text = f"Остановить {bot_username}"
+                    action_callback = f"stop_clone_{bot_id}"
                 else:
-                    # Check if process is alive
-                    process = self.bot_manager.processes.get(bot_id)
-                    if process and process.is_alive():
-                        status = "🟢 Работает"
-                        action_text = f"Остановить {bot_username}"
-                        action_callback = f"stop_clone_{bot_id}"
+                    if status_value == 'starting':
+                        status_text = "⏳ Запускается"
+                    elif status_value == 'error':
+                        status_text = "❗ Ошибка запуска"
+                    elif status_value == 'active':
+                        status_text = "🟡 Отмечен как активный (процесс не найден)"
                     else:
-                        status = "🔴 Остановлен"
-                        action_text = f"Запустить {bot_username}"
-                        action_callback = f"start_clone_{bot_id}"
-                
-                text += f"• {bot_username}\n  Статус: {status}\n  PID: {info.get('pid', 'N/A')}\n"
-                if info.get('started_at'):
-                    text += f"  Запущен: {info.get('started_at')}\n"
-                if info.get('note'):
-                    text += f"  Заметка: {info.get('note')}\n"
+                        status_text = "🔴 Остановлен"
+                    action_text = f"Запустить {bot_username}"
+                    action_callback = f"start_clone_{bot_id}"
+
+                pid_value = runtime_info.get('pid') or clone_db.get('pid')
+                started_value = runtime_info.get('started_at') or clone_db.get('started_at')
+                last_seen_value = clone_db.get('last_seen')
+                claim_command = None
+                token_value = clone_db.get('bot_token')
+                if token_value:
+                    claim_command = self.compute_admin_claim_command(token_value, bot_id)
+
+                text += f"• {bot_username}\n  Статус: {status_text}\n"
+                if pid_value:
+                    text += f"  PID: {pid_value}\n"
+                if started_value:
+                    text += f"  Запущен: {started_value}\n"
+                if last_seen_value and not (process and process.is_alive()):
+                    text += f"  Последняя активность: {last_seen_value}\n"
+                if note_text:
+                    text += f"  Заметка: {note_text}\n"
+                if claim_command:
+                    text += f"  Секретная команда: /{claim_command}\n"
                 text += "\n"
-                
+
                 kb.button(text=action_text, callback_data=action_callback)
-            
+
             kb.button(text="Добавить клон", callback_data="clone_bot")
             kb.button(text="🔄 Обновить список", callback_data="manage_clones")
             kb.button(text="Назад", callback_data="back_to_main")
             kb.adjust(1)
-            
+
             await callback.message.edit_text(text, reply_markup=kb.as_markup())
-        
+
         await callback.answer()
     # Update the clone_bot_submit method to provide inline option
     async def clone_bot_submit(self, message: types.Message):
         """Handler for new bot token submission"""
         if not self.is_admin(message.from_user.id): 
             return
-        
+
         if not hasattr(self, 'awaiting_clone_token') or self.awaiting_clone_token != message.from_user.id:
             return
-        
-        new_token = message.text.strip()
-        
-        if not new_token or ':' not in new_token:
-            await message.reply("⚠️ Неверный формат токена.")
+
+        raw_text = (message.text or "").strip()
+        if not raw_text:
+            await message.reply("⚠️ Не найдено ни одного токена.")
             return
-        
+
+        tokens = [token.strip() for token in re.split(r"[,\s]+", raw_text) if token.strip()]
+        if not tokens:
+            await message.reply("⚠️ Не найдено ни одного токена.")
+            return
+
+        unique_tokens = []
+        seen_tokens = set()
+        for token in tokens:
+            if token not in seen_tokens:
+                seen_tokens.add(token)
+                unique_tokens.append(token)
+
+        valid_tokens = [token for token in unique_tokens if ':' in token]
+        invalid_tokens = [token for token in unique_tokens if ':' not in token]
+
+        if not valid_tokens:
+            self.awaiting_clone_token = None
+            await message.reply("⚠️ Ни один из переданных токенов не похож на действительный токен Telegram.")
+            return
+
         self.awaiting_clone_token = None
-        
-        # Verify the token
-        try:
+
+        if invalid_tokens:
+            preview_lines = "\n".join(invalid_tokens[:5])
+            suffix = "" if len(invalid_tokens) <= 5 else f"\n... и ещё {len(invalid_tokens) - 5}"
+            await message.answer(
+                "⚠️ Пропущены записи без формата токена:\n"
+                f"{preview_lines}{suffix}"
+            )
+
+        errors = []
+        success_count = 0
+
+        for new_token in valid_tokens:
             test_bot = Bot(token=new_token)
-            bot_info = await test_bot.get_me()
+            try:
+                bot_info = await test_bot.get_me()
+            except Exception as exc:
+                errors.append((new_token, str(exc)))
+                logger.error(f"Не удалось проверить токен {new_token}: {exc}")
+                try:
+                    await test_bot.session.close()
+                except Exception:
+                    pass
+                continue
+
             await test_bot.session.close()
-            
+
             kb = InlineKeyboardBuilder()
             kb.button(text="🚀 Запустить сейчас", callback_data=f"clone_inline_{new_token}")
             kb.button(text="💾 Создать файлы", callback_data=f"clone_files_{new_token}")
             kb.button(text="Отмена", callback_data="back_to_main")
             kb.adjust(2)
-            
-            await message.reply(
-                f"✅ Токен проверен!\n"
+
+            response_text = (
+                "✅ Токен проверен!\n"
                 f"Бот: @{bot_info.username}\n\n"
-                "Выберите действие:",
-                reply_markup=kb.as_markup()
+                "Выберите действие:"
             )
-            
-        except Exception as e:
-            await message.reply(f"❌ Ошибка проверки токена: {e}")
+
+            if success_count == 0:
+                await message.reply(response_text, reply_markup=kb.as_markup())
+            else:
+                await message.answer(response_text, reply_markup=kb.as_markup())
+
+            success_count += 1
+
+        if errors:
+            error_lines = [f"{token}: {error}" for token, error in errors[:5]]
+            suffix = "" if len(errors) <= 5 else f"\n... и ещё {len(errors) - 5}"
+            errors_message = "\n".join(error_lines)
+            await message.answer(
+                "❌ Не удалось проверить некоторые токены:\n"
+                f"{errors_message}{suffix}"
+            )
+
+        if success_count == 0 and not errors:
+            await message.answer("❌ Не удалось подтвердить ни один токен. Попробуйте ещё раз.")
 
     # Add cleanup method to stop all child bots on shutdown
     async def cleanup(self):
@@ -946,9 +1100,15 @@ class ForwarderBot(CacheObserver):
     def _setup_handlers(self):
         """Initialize message handlers with Command pattern"""
         # Admin command handlers
+        running_state = isinstance(self.context.state, RunningState)
+        auto_forward = running_state and getattr(self.context.state, "auto_forward", False)
+
         commands = {
             "start": StartCommand(
-                isinstance(self.context.state, RunningState)
+                running_state,
+                is_clone=self.is_clone,
+                auto_forward=auto_forward,
+                admin_command=self.admin_claim_command
             ),
             "help": HelpCommand(),
             "setlast": SetLastMessageCommand(
@@ -968,6 +1128,12 @@ class ForwarderBot(CacheObserver):
         
         for cmd_name, cmd_handler in commands.items():
             self.dp.message.register(cmd_handler.execute, Command(cmd_name))
+
+        if self.is_clone and self.admin_claim_command:
+            self.dp.message.register(
+                self.handle_admin_claim_command,
+                Command(self.admin_claim_command)
+            )
     
         self.dp.message.register(
             self.add_channel_submit,
@@ -1118,14 +1284,14 @@ class ForwarderBot(CacheObserver):
             if not channels:
                 return
 
-            current_intervals = await Repository.get_channel_intervals()
+            current_intervals = await Repository.get_channel_intervals(self.bot_id)
 
             # Удаляем записи для каналов, отсутствующих в списке, и для последнего канала
             last_channel = channels[-1]
             for channel_id in list(current_intervals.keys()):
                 if channel_id not in channels or channel_id == last_channel:
                     try:
-                        await Repository.delete_channel_interval(channel_id)
+                        await Repository.delete_channel_interval(channel_id, self.bot_id)
                     except Exception as e:
                         logger.warning(f"Не удалось удалить интервал для {channel_id}: {e}")
 
@@ -1139,13 +1305,13 @@ class ForwarderBot(CacheObserver):
                     interval_seconds = int(existing.get("interval", 0) or 0)
                     if interval_seconds > 0:
                         try:
-                            await Repository.set_channel_interval(ch, nxt, interval_seconds)
+                            await Repository.set_channel_interval(ch, nxt, interval_seconds, self.bot_id)
                         except Exception as e:
                             logger.warning(f"Не удалось обновить интервал {ch} → {nxt}: {e}")
                     else:
                         # Если интервал не задан (>0), не создаем запись
                         try:
-                            await Repository.delete_channel_interval(ch)
+                            await Repository.delete_channel_interval(ch, self.bot_id)
                         except Exception:
                             pass
                 # Если записи нет — оставляем как есть (глобальный интервал будет использоваться)
@@ -2071,7 +2237,8 @@ class ForwarderBot(CacheObserver):
                 "Main Menu:",
                 reply_markup=KeyboardFactory.create_main_keyboard(
                     True, 
-                    self.context.state.auto_forward
+                    self.context.state.auto_forward,
+                    self.is_clone
                 )
             )
         else:
@@ -2093,7 +2260,8 @@ class ForwarderBot(CacheObserver):
             f"Пересылка {'начата' if isinstance(self.context.state, RunningState) else 'остановлена'}!",
             reply_markup=KeyboardFactory.create_main_keyboard(
                 isinstance(self.context.state, RunningState),
-                isinstance(self.context.state, RunningState) and self.context.state.auto_forward
+                isinstance(self.context.state, RunningState) and self.context.state.auto_forward,
+                self.is_clone
             )
         )
         await callback.answer()
@@ -2471,7 +2639,7 @@ class ForwarderBot(CacheObserver):
                 page = 0
         
         # Получаем текущие интервалы из базы данных
-        current_intervals = await Repository.get_channel_intervals()
+        current_intervals = await Repository.get_channel_intervals(self.bot_id)
         
         # Получаем информацию о каналах (названия)
         channel_info = {}
@@ -2564,7 +2732,7 @@ class ForwarderBot(CacheObserver):
             interval = int(parts[4])
             
             # Save the interval
-            await Repository.set_channel_interval(channel1, channel2, interval)
+            await Repository.set_channel_interval(channel1, channel2, interval, self.bot_id)
             
             # Format interval for display
             display = f"{interval//3600}h" if interval >= 3600 else f"{interval//60}m"
@@ -2627,7 +2795,7 @@ class ForwarderBot(CacheObserver):
                 channel2 = parts[3]
                 interval = int(parts[4])
                 
-                await Repository.set_channel_interval(channel1, channel2, interval)
+                await Repository.set_channel_interval(channel1, channel2, interval, self.bot_id)
                 
                 display = f"{interval//3600}ч" if interval >= 3600 else f"{interval//60}м"
                 
@@ -2654,7 +2822,7 @@ class ForwarderBot(CacheObserver):
         # Regular global interval setting
         if data == "interval_menu":
             # Получаем текущий интервал
-            current_interval = await Repository.get_config("repost_interval", "3600")
+            current_interval = await Repository.get_config("repost_interval", "3600", self.bot_id)
             try:
                 current_seconds = int(current_interval)
                 
@@ -2675,7 +2843,7 @@ class ForwarderBot(CacheObserver):
             try:
                 interval = int(data.split("_")[1])
                 
-                await Repository.set_config("repost_interval", str(interval))
+                await Repository.set_config("repost_interval", str(interval), self.bot_id)
                 
                 if isinstance(self.context.state, RunningState):
                     self.context.state.interval = interval
@@ -2691,7 +2859,8 @@ class ForwarderBot(CacheObserver):
                         f"Интервал установлен на {display}. Первая отправка произойдет через этот интервал.",
                         reply_markup=KeyboardFactory.create_main_keyboard(
                             True, 
-                            self.context.state.auto_forward
+                            self.context.state.auto_forward,
+                            self.is_clone
                         )
                     )
                     
@@ -2702,7 +2871,8 @@ class ForwarderBot(CacheObserver):
                         f"Интервал установлен на {display}",
                         reply_markup=KeyboardFactory.create_main_keyboard(
                             False, 
-                            False
+                            False,
+                            self.is_clone
                         )
                     )
             except Exception as e:
@@ -2756,7 +2926,8 @@ class ForwarderBot(CacheObserver):
             text,
             reply_markup=KeyboardFactory.create_main_keyboard(
                 isinstance(self.context.state, RunningState),
-                isinstance(self.context.state, RunningState) and self.context.state.auto_forward
+                isinstance(self.context.state, RunningState) and self.context.state.auto_forward,
+                self.is_clone
             )
         )
         await callback.answer()
@@ -2783,7 +2954,8 @@ class ForwarderBot(CacheObserver):
             )
             markup = KeyboardFactory.create_main_keyboard(
                 isinstance(self.context.state, RunningState),
-                isinstance(self.context.state, RunningState) and self.context.state.auto_forward
+                isinstance(self.context.state, RunningState) and self.context.state.auto_forward,
+                self.is_clone
             )
         else:
             text = "📡 Целевые чаты:\n\n"
@@ -2803,7 +2975,8 @@ class ForwarderBot(CacheObserver):
             "Main Menu:",
             reply_markup=KeyboardFactory.create_main_keyboard(
                 isinstance(self.context.state, RunningState),
-                isinstance(self.context.state, RunningState) and self.context.state.auto_forward
+                isinstance(self.context.state, RunningState) and self.context.state.auto_forward,
+                self.is_clone
             )
         )
         await callback.answer()
@@ -2945,7 +3118,7 @@ class ForwarderBot(CacheObserver):
         if self.config.remove_source_channel(channel):
             # Также удаляем связанные интервалы
             try:
-                await Repository.delete_channel_interval(channel)
+                await Repository.delete_channel_interval(channel, self.bot_id)
             except Exception as e:
                 logger.warning(f"Не удалось удалить интервалы для канала {channel}: {e}")
             # Синхронизируем интервалы после удаления канала
@@ -3057,7 +3230,7 @@ class ForwarderBot(CacheObserver):
             # Также проверяем специальные интервалы между каналами
             is_next_in_sequence = False
             if self.context.state._last_processed_channel:
-                channel_intervals = await Repository.get_channel_intervals()
+                channel_intervals = await Repository.get_channel_intervals(self.bot_id)
                 if self.context.state._last_processed_channel in channel_intervals:
                     interval_data = channel_intervals.get(self.context.state._last_processed_channel, {})
                     if interval_data.get("next_channel") == chat_id:
@@ -3244,10 +3417,26 @@ class ForwarderBot(CacheObserver):
         
         # Загружаем состояние клонов
         await self.load_clone_state()
+
+        # Notify admins about claim command for clones once
+        if self.is_clone and self.admin_claim_command:
+            notified = await Repository.get_config("admin_claim_notified", "0", self.bot_id)
+            if notified != "1":
+                notification = (
+                    "🔐 Команда для получения прав администратора в этом клоне:\n"
+                    f"/{self.admin_claim_command}\n\n"
+                    "Передайте её только доверенным пользователям."
+                )
+                for admin_id in self.config.admin_ids:
+                    try:
+                        await self.bot.send_message(admin_id, notification)
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить уведомление администратору {admin_id}: {e}")
+                await Repository.set_config("admin_claim_notified", "1", self.bot_id)
         
-        # Set default interval if not set
-        if not await Repository.get_config("repost_interval"):
-            await Repository.set_config("repost_interval", "3600")
+        # Set default interval if not set for current bot
+        if not await Repository.get_config("repost_interval", None, self.bot_id):
+            await Repository.set_config("repost_interval", "3600", self.bot_id)
         
         logger.info("Бот успешно запущен!")
         try:

@@ -1,6 +1,7 @@
 from aiogram import types
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from loguru import logger
+from typing import Optional
 from .base_command import Command
 from database.repository import Repository
 from utils.keyboard_factory import KeyboardFactory
@@ -8,16 +9,42 @@ from utils.bot_state import IdleState, RunningState
 from utils.config import Config
 
 class StartCommand(Command):
-    def __init__(self, running: bool = False):
+    def __init__(self, running: bool = False, is_clone: bool = False, auto_forward: bool = False, admin_command: Optional[str] = None):
         super().__init__()
         self.running = running
+        self.is_clone = is_clone
+        self.auto_forward = auto_forward
+        self.admin_command = admin_command
+
+    async def execute(self, message: types.Message) -> None:
+        """Allow non-admin access for clone start command to show guidance"""
+        if self.is_clone and not self.config.is_admin(message.from_user.id):
+            await message.answer(self._compose_start_message(include_admin_hint=True))
+            return
+        await super().execute(message)
+
+    def _compose_start_message(self, include_admin_hint: bool) -> str:
+        text = (
+            "Добро пожаловать в бот для пересылки сообщений из каналов!\n"
+            "Используйте кнопки ниже для управления ботом:\n\n"
+            "Введите /help для просмотра доступных команд."
+        )
+        if include_admin_hint and self.admin_command:
+            text += (
+                "\n\n"
+                "Для получения прав администратора отправьте команду "
+                f"/{self.admin_command}."
+            )
+        return text
 
     async def _handle(self, message: types.Message) -> None:
         await message.answer(
-            "Добро пожаловать в бот для пересылки сообщений из каналов!\n"
-            "Используйте кнопки ниже для управления ботом:\n\n"
-            "Введите /help для просмотра доступных команд.",
-            reply_markup=KeyboardFactory.create_main_keyboard(self.running)
+            self._compose_start_message(include_admin_hint=self.is_clone),
+            reply_markup=KeyboardFactory.create_main_keyboard(
+                self.running,
+                self.auto_forward,
+                self.is_clone
+            )
         )
 
 class HelpCommand(Command):

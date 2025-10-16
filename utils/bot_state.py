@@ -32,7 +32,7 @@ class IdleState(BotState):
         self.auto_forward = auto_forward
     
     async def start(self) -> None:
-        interval = int(await Repository.get_config("repost_interval", "3600"))
+        interval = int(await Repository.get_config("repost_interval", "3600", self.context.bot_id))
         self.context.state = RunningState(self.context, interval, self.auto_forward)
         await self.context._notify_admins("Бот начал пересылку")
     
@@ -201,7 +201,7 @@ class RunningState(BotState):
         """Get the interval between two channels (if set)"""
         try:
             # Get from database
-            intervals = await Repository.get_channel_intervals()
+            intervals = await Repository.get_channel_intervals(self.context.bot_id)
             
             # Check if this pair has a configured interval
             for pair_key, pair_data in intervals.items():
@@ -283,7 +283,7 @@ class RunningState(BotState):
                     continue
                 
                 # Получаем все интервалы для каналов
-                channel_intervals = await Repository.get_channel_intervals()
+                channel_intervals = await Repository.get_channel_intervals(self.context.bot_id)
                 
                 # Если предыдущий канал не определен, начинаем с первого канала
                 if self._last_processed_channel is None:
@@ -589,9 +589,10 @@ class RunningState(BotState):
 class BotContext:
     """Context class that maintains current bot state"""
     
-    def __init__(self, bot, config):
+    def __init__(self, bot, config, bot_id: str = "main"):
         self.bot = bot
         self.config = config
+        self.bot_id = bot_id
         self.state: BotState = IdleState(self)
     
     async def start(self) -> None:
