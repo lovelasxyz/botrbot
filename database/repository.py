@@ -99,6 +99,13 @@ class Repository:
                     interval_seconds INTEGER DEFAULT 900,
                     PRIMARY KEY (bot_id, channel_id)
                 );
+                CREATE TABLE IF NOT EXISTS invalid_chats_cache (
+                    chat_id INTEGER PRIMARY KEY,
+                    error_type TEXT,
+                    error_message TEXT,
+                    last_error_at REAL DEFAULT (strftime('%s','now')),
+                    next_retry_at REAL
+                );
                 CREATE TABLE IF NOT EXISTS bot_clones (
                     bot_id TEXT PRIMARY KEY,
                     bot_token TEXT,
@@ -147,6 +154,7 @@ class Repository:
                 CREATE INDEX IF NOT EXISTS idx_admin_log_timestamp ON admin_log(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_admin_log_batch_id ON admin_log(batch_id);
                 CREATE INDEX IF NOT EXISTS idx_bot_clones_status ON bot_clones(status);
+                CREATE INDEX IF NOT EXISTS idx_invalid_chats_next_retry ON invalid_chats_cache(next_retry_at);
             """)
             
             # Apply lightweight migrations for existing databases
@@ -544,6 +552,55 @@ class Repository:
                 (chat_id,)
             )
             await db.commit()
+
+    @staticmethod
+    async def upsert_invalid_chat_cache(chat_id: int, error_type: str, error_message: str,
+                                        retry_after_seconds: Optional[int] = None) -> None:
+        """Persist invalid chat metadata for later review."""
+        now_ts = datetime.now().timestamp()
+        next_retry = now_ts + retry_after_seconds if retry_after_seconds else None
+        async with DatabaseConnectionPool.get_connection() as db:
+            await db.execute(
+                """
+                INSERT INTO invalid_chats_cache (chat_id, error_type, error_message, last_error_at, next_retry_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    error_type = excluded.error_type,
+                    error_message = excluded.error_message,
+                    last_error_at = excluded.last_error_at,
+                    next_retry_at = excluded.next_retry_at
+                """,
+                (chat_id, error_type, error_message, now_ts, next_retry)
+            )
+            await db.commit()
+
+    @staticmethod
+    async def remove_invalid_chat_cache(chat_id: int) -> None:
+        """Remove invalid chat cache entry."""
+        async with DatabaseConnectionPool.get_connection() as db:
+            await db.execute(
+                "DELETE FROM invalid_chats_cache WHERE chat_id = ?",
+                (chat_id,)
+            )
+            await db.commit()
+
+    @staticmethod
+    async def get_invalid_chats_cache() -> Dict[int, Dict[str, Any]]:
+        """Fetch persisted invalid chat cache."""
+        async with DatabaseConnectionPool.get_connection() as db:
+            async with db.execute(
+                "SELECT chat_id, error_type, error_message, last_error_at, next_retry_at FROM invalid_chats_cache"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return {
+                    row[0]: {
+                        'error_type': row[1],
+                        'error_message': row[2],
+                        'last_error_at': row[3],
+                        'next_retry_at': row[4]
+                    }
+                    for row in rows
+                }
 
     @staticmethod
     async def get_config(key: str, default: Optional[str] = None, bot_id: str = "main") -> Optional[str]:

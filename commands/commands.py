@@ -27,14 +27,7 @@ class StartCommand(Command):
         text = (
             "Добро пожаловать в бот для пересылки сообщений из каналов!\n"
             "Используйте кнопки ниже для управления ботом:\n\n"
-            "Введите /help для просмотра доступных команд."
         )
-        if include_admin_hint and self.admin_command:
-            text += (
-                "\n\n"
-                "Для получения прав администратора отправьте команду "
-                f"/{self.admin_command}."
-            )
         return text
 
     async def _handle(self, message: types.Message) -> None:

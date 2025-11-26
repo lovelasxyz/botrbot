@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 import threading
 import importlib.util
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from multiprocessing import Process
 import multiprocessing
 
@@ -2892,7 +2892,7 @@ class ForwarderBot(CacheObserver):
         try:
             chat_id = int(callback.data.split("_")[1])
             await Repository.remove_target_chat(chat_id)
-            self.cache_service.remove_from_cache(chat_id)
+            await self.cache_service.remove_from_cache(chat_id)
             await self.list_chats(callback)
             await callback.answer("Чат удален!")
         except ValueError:
@@ -3342,6 +3342,116 @@ class ForwarderBot(CacheObserver):
         else:
             logger.info("Бот не запущен, игнорирую сообщение")
 
+    async def _validate_existing_chats(self) -> None:
+        """Validate target chats stored in the database on startup."""
+        try:
+            target_chats = await Repository.get_target_chats()
+        except Exception as exc:
+            logger.error(f"Не удалось получить список целевых чатов: {exc}")
+            return
+
+        if not target_chats:
+            logger.debug("Нет целевых чатов для проверки")
+            return
+
+        logger.info(f"Проверяю доступность {len(target_chats)} целевых чатов")
+        problematic: list[tuple[int, str]] = []
+
+        for chat_id in target_chats:
+            info = await self.cache_service.get_chat_info(self.bot, chat_id, force_refresh=True)
+            if info:
+                continue
+
+            invalid_meta = self.cache_service.get_invalid_chats().get(chat_id, {})
+            reason = invalid_meta.get('error_type') or 'unknown'
+            problematic.append((chat_id, reason))
+
+        if not problematic:
+            logger.debug("Все целевые чаты доступны")
+            return
+
+        summary_lines = [f"• {chat_id} ({reason})" for chat_id, reason in problematic[:10]]
+        if len(problematic) > 10:
+            summary_lines.append(f"... и ещё {len(problematic) - 10}")
+
+        message = (
+            "⚠️ Некоторые целевые чаты недоступны после перезапуска:\n"
+            + "\n".join(summary_lines)
+            + "\nЧаты отмечены как требующие ручной проверки."
+        )
+
+        logger.warning(message.replace("⚠️ ", ""))
+        await self._notify_admins(message)
+
+    async def _validate_source_channels(self) -> None:
+        """Validate configured source channels on startup."""
+        channels = list(self.config.source_channels)
+        if not channels:
+            logger.debug("Нет исходных каналов для проверки")
+            return
+
+        logger.info(f"Проверяю доступность {len(channels)} каналов-источников")
+
+        unavailable: list[str] = []
+        insufficient_rights: list[str] = []
+
+        def normalize_channel(value: str) -> Union[int, str]:
+            raw = str(value).strip()
+            if raw.startswith('-') and raw[1:].isdigit():
+                try:
+                    return int(raw)
+                except ValueError:
+                    return raw
+            if raw.isdigit():
+                try:
+                    return int(raw)
+                except ValueError:
+                    return raw
+            if raw.startswith('@'):
+                return raw
+            return f"@{raw}"
+
+        for channel in channels:
+            identifier = normalize_channel(channel)
+
+            try:
+                info = await self.cache_service.get_chat_info(self.bot, identifier, force_refresh=True)
+            except Exception as exc:
+                logger.warning(f"Не удалось проверить канал-источник {channel}: {exc}")
+                unavailable.append(str(channel))
+                continue
+
+            if not info:
+                unavailable.append(str(channel))
+                continue
+
+            try:
+                member = await self.bot.get_chat_member(info.id, self.bot.id)
+                if member.status not in ('administrator', 'creator'):
+                    insufficient_rights.append(info.title or str(info.id))
+            except Exception as rights_error:
+                logger.debug(f"Не удалось проверить права бота в канале {info.id}: {rights_error}")
+
+        if not unavailable and not insufficient_rights:
+            logger.debug("Права и доступ к каналам-источникам подтверждены")
+            return
+
+        lines = ["⚠️ Проверка каналов-источников выявила проблемы:"]
+        if unavailable:
+            lines.append("Недоступны:")
+            lines.extend(f"• {name}" for name in unavailable[:10])
+            if len(unavailable) > 10:
+                lines.append(f"... и ещё {len(unavailable) - 10}")
+        if insufficient_rights:
+            lines.append("Недостаточно прав администратора:")
+            lines.extend(f"• {name}" for name in insufficient_rights[:10])
+            if len(insufficient_rights) > 10:
+                lines.append(f"... и ещё {len(insufficient_rights) - 10}")
+
+        message = "\n".join(lines)
+        logger.warning(message.replace("⚠️ ", ""))
+        await self._notify_admins(message)
+
     async def handle_chat_member(self, update: types.ChatMemberUpdated):
         """Handler for bot being added/removed from chats with detailed chat information"""
         if update.new_chat_member.user.id != self.bot.id:
@@ -3382,17 +3492,24 @@ class ForwarderBot(CacheObserver):
         
         if is_member and update.chat.type in ['group', 'supergroup']:
             await Repository.add_target_chat(chat_id)
-            self.cache_service.remove_from_cache(chat_id)
+            await self.cache_service.remove_from_cache(chat_id)
             
             message = f"✅ Бот добавлен в {chat_info}"
             await self._notify_admins(message)
             logger.info(f"Бот добавлен в {chat_info}")
             
         elif not is_member:
-            await Repository.remove_target_chat(chat_id)
-            self.cache_service.remove_from_cache(chat_id)
+            await self.cache_service.mark_chat_invalid(
+                chat_id,
+                "membership_lost",
+                "Bot removed according to chat member update"
+            )
+            self.cache_service.drop_cache_entry(chat_id)
             
-            message = f"❌ Бот удален из {chat_info}"
+            message = (
+                f"❌ Бот удален из {chat_info}\n"
+                "Чат отмечен для ручной проверки и не удален автоматически."
+            )
             await self._notify_admins(message)
             logger.info(f"Бот удален из {chat_info}")
 
@@ -3414,6 +3531,13 @@ class ForwarderBot(CacheObserver):
     async def start(self):
         """Start the bot"""
         await Repository.init_db()
+
+        # Ensure cache service has persisted state before validation
+        await self.cache_service.initialize()
+
+        # Validate previously configured chats and channels before polling starts
+        await self._validate_existing_chats()
+        await self._validate_source_channels()
         
         # Загружаем состояние клонов
         await self.load_clone_state()

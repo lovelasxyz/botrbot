@@ -72,6 +72,21 @@ def ensure_indices(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE INDEX IF NOT EXISTS idx_bot_clones_status ON bot_clones(status);
+        CREATE INDEX IF NOT EXISTS idx_invalid_chats_next_retry ON invalid_chats_cache(next_retry_at);
+        """
+    )
+
+
+def ensure_table_invalid_chats_cache(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invalid_chats_cache (
+            chat_id INTEGER PRIMARY KEY,
+            error_type TEXT,
+            error_message TEXT,
+            last_error_at REAL DEFAULT (strftime('%s','now')),
+            next_retry_at REAL
+        )
         """
     )
 
@@ -85,6 +100,7 @@ def main() -> None:
         # Avoid manual BEGIN/COMMIT to prevent 'no transaction is active' errors
         # in environments where autocommit may be enabled.
         ensure_table_admin_operations(conn)
+        ensure_table_invalid_chats_cache(conn)
         ensure_table_bot_clones_columns(conn)
         migrate_config_to_per_bot(conn)
         migrate_channel_intervals_to_per_bot(conn)

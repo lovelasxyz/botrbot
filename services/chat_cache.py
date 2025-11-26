@@ -1,8 +1,9 @@
 from datetime import datetime
-from typing import Optional, Dict, List, Protocol
+from typing import Optional, Dict, List, Protocol, Union
 from dataclasses import dataclass
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
+from loguru import logger
 from utils.config import Config
 
 @dataclass
@@ -14,6 +15,16 @@ class ChatInfo:
     member_count: Optional[int] = None
     last_updated: float = 0.0
     is_valid: bool = True
+
+
+@dataclass
+class InvalidChatInfo:
+    """Represents invalid chat metadata persisted across restarts."""
+    chat_id: int
+    error_type: str
+    error_message: str
+    last_error_at: float
+    next_retry_at: Optional[float] = None
 
 class CacheObserver(Protocol):
     """Protocol for cache update observers"""
@@ -28,9 +39,6 @@ class CacheObserver(Protocol):
 class ChatCacheService:
     """Enhanced chat cache service with robust error handling"""
     _instance = None
-    _cache: Dict[int, ChatInfo] = {}
-    _observers: List[CacheObserver] = []
-    _invalid_chats: Dict[int, dict] = {}  # Track invalid chats with error details
     
     def __new__(cls):
         if cls._instance is None:
@@ -43,6 +51,11 @@ class ChatCacheService:
             return
         self._initialized = True
         self._config = Config()
+        self._cache: Dict[int, ChatInfo] = {}
+        self._observers: List[CacheObserver] = []
+        self._invalid_chats: Dict[int, InvalidChatInfo] = {}
+        self._alias_map: Dict[str, int] = {}
+        self._invalid_loaded = False
     
     def add_observer(self, observer: CacheObserver) -> None:
         """Add observer for cache updates"""
@@ -60,7 +73,6 @@ class ChatCacheService:
             try:
                 await observer.on_cache_update(chat_id, info)
             except Exception as e:
-                from loguru import logger
                 logger.error(f"Error notifying observer about cache update: {e}")
     
     async def _notify_invalid_chat(self, chat_id: int, reason: str) -> None:
@@ -70,168 +82,269 @@ class ChatCacheService:
                 if hasattr(observer, 'on_chat_invalid'):
                     await observer.on_chat_invalid(chat_id, reason)
             except Exception as e:
-                from loguru import logger
                 logger.error(f"Error notifying observer about invalid chat: {e}")
     
-    def _is_chat_known_invalid(self, chat_id: int) -> bool:
-        """Check if chat is known to be invalid"""
-        if chat_id in self._invalid_chats:
-            error_time = self._invalid_chats[chat_id].get('timestamp', 0)
-            # Re-check invalid chats after 1 hour
-            if datetime.now().timestamp() - error_time < 3600:
-                return True
-            else:
-                # Remove from invalid list after 1 hour for re-checking
-                del self._invalid_chats[chat_id]
-        return False
-    
-    def _mark_chat_invalid(self, chat_id: int, error_type: str, error_message: str) -> None:
-        """Mark a chat as invalid with error details"""
-        self._invalid_chats[chat_id] = {
-            'error_type': error_type,
-            'error_message': error_message,
-            'timestamp': datetime.now().timestamp()
-        }
-        
-        # Also mark in cache if exists
+    async def initialize(self) -> None:
+        """Load persisted invalid chat cache if needed."""
+        if self._invalid_loaded:
+            return
+        await self._ensure_persistent_invalid_cache_loaded()
+
+    async def _ensure_persistent_invalid_cache_loaded(self) -> None:
+        if self._invalid_loaded:
+            return
+        try:
+            from database.repository import Repository
+            records = await Repository.get_invalid_chats_cache()
+        except Exception as exc:
+            logger.error(f"Failed to load invalid chat cache: {exc}")
+            self._invalid_loaded = True
+            return
+
+        for raw_chat_id, payload in (records or {}).items():
+            try:
+                chat_id = int(raw_chat_id)
+            except (TypeError, ValueError):
+                continue
+
+            data = payload or {}
+            self._invalid_chats[chat_id] = InvalidChatInfo(
+                chat_id=chat_id,
+                error_type=data.get('error_type') or "",
+                error_message=data.get('error_message') or "",
+                last_error_at=data.get('last_error_at') or 0.0,
+                next_retry_at=data.get('next_retry_at')
+            )
+
+        self._invalid_loaded = True
+
+    def _resolve_cache_key(self, chat_id: Union[int, str]) -> Union[int, str]:
+        if isinstance(chat_id, int):
+            return chat_id
+        if chat_id is None:
+            return ""
+        candidate = str(chat_id).strip()
+        if not candidate:
+            return candidate
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            alias = candidate.lower()
+            return self._alias_map.get(alias, alias)
+
+    def _remember_alias(self, original: Union[int, str], resolved_id: int) -> None:
+        if isinstance(original, int):
+            self._alias_map[str(original)] = resolved_id
+            return
+        key = str(original).strip().lower()
+        if key:
+            self._alias_map[key] = resolved_id
+
+    def _is_chat_known_invalid(self, chat_id: int, *, now_ts: Optional[float] = None) -> bool:
+        entry = self._invalid_chats.get(chat_id)
+        if not entry:
+            return False
+        now_ts = now_ts or datetime.now().timestamp()
+        if entry.next_retry_at is not None and now_ts >= entry.next_retry_at:
+            return False
+        return True
+
+    async def _mark_chat_invalid(
+        self,
+        chat_id: int,
+        error_type: str,
+        error_message: str,
+        retry_after_seconds: Optional[int] = None
+    ) -> None:
+        await self.initialize()
+        now_ts = datetime.now().timestamp()
+        next_retry = now_ts + retry_after_seconds if retry_after_seconds else None
+
+        self._invalid_chats[chat_id] = InvalidChatInfo(
+            chat_id=chat_id,
+            error_type=error_type,
+            error_message=error_message,
+            last_error_at=now_ts,
+            next_retry_at=next_retry
+        )
+
         if chat_id in self._cache:
             self._cache[chat_id].is_valid = False
-    
-    async def get_chat_info(self, bot: Bot, chat_id: int, force_refresh: bool = False) -> Optional[ChatInfo]:
-        """Get chat info from cache or fetch from API with enhanced error handling"""
-        from loguru import logger
-        
-        # Check if chat is known to be invalid
-        if not force_refresh and self._is_chat_known_invalid(chat_id):
-            logger.debug(f"Skipping known invalid chat {chat_id}")
-            return None
-        
-        now = datetime.now().timestamp()
-        
-        # Check cache first (unless force refresh)
-        if not force_refresh and chat_id in self._cache:
-            chat_info = self._cache[chat_id]
-            if chat_info.is_valid and now - chat_info.last_updated < self._config.cache_ttl:
-                return chat_info
 
         try:
-            # Fetch fresh data from Telegram API
-            chat = await bot.get_chat(chat_id)
-            
-            # Try to get member count, but don't fail if we can't
+            from database.repository import Repository
+            await Repository.upsert_invalid_chat_cache(chat_id, error_type, error_message, retry_after_seconds)
+        except Exception as exc:
+            logger.error(f"Failed to persist invalid chat {chat_id}: {exc}")
+
+    async def mark_chat_invalid(
+        self,
+        chat_id: int,
+        error_type: str,
+        error_message: str,
+        retry_after_seconds: Optional[int] = None
+    ) -> None:
+        """Public helper to mark a chat as invalid and persist the state."""
+        await self._mark_chat_invalid(chat_id, error_type, error_message, retry_after_seconds)
+
+    async def _clear_invalid_chat(self, chat_id: int) -> None:
+        if chat_id in self._invalid_chats:
+            del self._invalid_chats[chat_id]
+        try:
+            from database.repository import Repository
+            await Repository.remove_invalid_chat_cache(chat_id)
+        except Exception as exc:
+            logger.warning(f"Failed to clear invalid chat cache for {chat_id}: {exc}")
+
+    async def get_chat_info(self, bot: Bot, chat_id: Union[int, str], force_refresh: bool = False) -> Optional[ChatInfo]:
+        """Get chat info from cache or fetch from API with enhanced error handling."""
+        await self.initialize()
+        now = datetime.now().timestamp()
+        cache_key = self._resolve_cache_key(chat_id)
+        numeric_key = cache_key if isinstance(cache_key, int) else None
+
+        if not force_refresh and numeric_key is not None and self._is_chat_known_invalid(numeric_key, now_ts=now):
+            logger.debug(f"Skipping known invalid chat {numeric_key}")
+            return None
+
+        if not force_refresh and numeric_key is not None:
+            cached = self._cache.get(numeric_key)
+            if cached and cached.is_valid and now - cached.last_updated < self._config.cache_ttl:
+                return cached
+
+        lookup_value = chat_id
+        if isinstance(chat_id, str):
+            stripped = chat_id.strip()
+            if stripped.startswith('@') or stripped.lstrip('-').isdigit():
+                lookup_value = stripped
+            else:
+                lookup_value = f"@{stripped}"
+
+        try:
+            chat = await bot.get_chat(lookup_value)
+
             member_count = None
             try:
-                member_count = await bot.get_chat_member_count(chat_id)
+                member_count = await bot.get_chat_member_count(chat.id)
             except Exception as member_error:
-                logger.debug(f"Could not get member count for chat {chat_id}: {member_error}")
-            
+                logger.debug(f"Could not get member count for chat {chat.id}: {member_error}")
+
             info = ChatInfo(
-                id=chat_id,
-                title=chat.title or f"Chat {chat_id}",
+                id=chat.id,
+                title=(chat.title or getattr(chat, "full_name", None) or f"Chat {chat.id}"),
                 type=chat.type,
                 member_count=member_count,
                 last_updated=now,
                 is_valid=True
             )
-            
-            # Update cache
-            self._cache[chat_id] = info
-            
-            # Remove from invalid list if it was there
-            if chat_id in self._invalid_chats:
-                del self._invalid_chats[chat_id]
-                logger.info(f"Chat {chat_id} is now valid again")
-            
-            # Notify observers
-            await self._notify_observers(chat_id, info)
-            
-            # Cleanup old entries if cache is too large
+
+            self._cache[chat.id] = info
+            self._remember_alias(chat_id, chat.id)
+
+            if numeric_key is not None and numeric_key != chat.id:
+                self._cache.pop(numeric_key, None)
+
+            if chat.id in self._invalid_chats:
+                await self._clear_invalid_chat(chat.id)
+                logger.info(f"Chat {chat.id} is now valid again")
+
+            await self._notify_observers(chat.id, info)
+
             if len(self._cache) > self._config.max_cache_size:
                 oldest = min(self._cache.items(), key=lambda x: x[1].last_updated)
                 del self._cache[oldest[0]]
-            
+
             return info
-            
+
         except TelegramBadRequest as e:
             error_msg = str(e).lower()
-            
+            target_id = numeric_key
+
             if "group chat was upgraded to a supergroup" in error_msg:
                 logger.warning(f"Chat {chat_id} was upgraded to supergroup")
-                self._mark_chat_invalid(chat_id, "upgraded", str(e))
-                await self._notify_invalid_chat(chat_id, "Chat was upgraded to supergroup")
-                
-            elif "chat not found" in error_msg:
+                if target_id is not None:
+                    await self._mark_chat_invalid(target_id, "upgraded", str(e))
+                    await self._notify_invalid_chat(target_id, "Chat was upgraded to supergroup")
+            elif "chat not found" in error_msg or "chat_id_invalid" in error_msg:
                 logger.warning(f"Chat {chat_id} not found")
-                self._mark_chat_invalid(chat_id, "not_found", str(e))
-                await self._notify_invalid_chat(chat_id, "Chat not found")
-                
-            elif "bad request" in error_msg:
-                logger.warning(f"Bad request for chat {chat_id}: {e}")
-                self._mark_chat_invalid(chat_id, "bad_request", str(e))
-                await self._notify_invalid_chat(chat_id, f"Bad request: {e}")
-                
+                if target_id is not None:
+                    await self._mark_chat_invalid(target_id, "not_found", str(e))
+                    await self._notify_invalid_chat(target_id, "Chat not found")
+            elif "bot was kicked" in error_msg or "bot is not a member" in error_msg:
+                logger.warning(f"Bot removed from chat {chat_id}: {e}")
+                if target_id is not None:
+                    await self._mark_chat_invalid(target_id, "kicked", str(e))
+                    await self._notify_invalid_chat(target_id, "Bot removed from chat")
             else:
                 logger.error(f"Telegram bad request for chat {chat_id}: {e}")
-                self._mark_chat_invalid(chat_id, "bad_request", str(e))
-            
+
             return None
-            
+
         except TelegramForbiddenError as e:
             logger.warning(f"Bot forbidden in chat {chat_id}: {e}")
-            self._mark_chat_invalid(chat_id, "forbidden", str(e))
-            await self._notify_invalid_chat(chat_id, "Bot was removed or blocked from chat")
+            if numeric_key is not None:
+                await self._mark_chat_invalid(numeric_key, "forbidden", str(e))
+                await self._notify_invalid_chat(numeric_key, "Bot was removed or blocked from chat")
             return None
-            
+
         except TelegramNotFound as e:
             logger.warning(f"Chat {chat_id} not found: {e}")
-            self._mark_chat_invalid(chat_id, "not_found", str(e))
-            await self._notify_invalid_chat(chat_id, "Chat not found")
+            if numeric_key is not None:
+                await self._mark_chat_invalid(numeric_key, "not_found", str(e))
+                await self._notify_invalid_chat(numeric_key, "Chat not found")
             return None
-            
+
         except Exception as e:
             logger.error(f"Unexpected error fetching chat info for {chat_id}: {e}")
-            # Don't mark as invalid for unexpected errors, might be temporary
             return None
-    
+
     def get_invalid_chats(self) -> Dict[int, dict]:
-        """Get list of invalid chats with error details"""
-        return self._invalid_chats.copy()
-    
-    def clear_invalid_chat(self, chat_id: int) -> bool:
-        """Clear a chat from invalid list (for manual retry)"""
-        if chat_id in self._invalid_chats:
-            del self._invalid_chats[chat_id]
-            return True
-        return False
-    
+        """Get list of invalid chats with error details."""
+        return {
+            chat_id: {
+                'error_type': info.error_type,
+                'error_message': info.error_message,
+                'last_error_at': info.last_error_at,
+                'next_retry_at': info.next_retry_at
+            }
+            for chat_id, info in self._invalid_chats.items()
+        }
+
+    async def clear_invalid_chat(self, chat_id: int) -> bool:
+        """Clear a chat from invalid list (for manual retry)."""
+        if chat_id not in self._invalid_chats:
+            return False
+        await self._clear_invalid_chat(chat_id)
+        if chat_id in self._cache:
+            self._cache[chat_id].is_valid = True
+        return True
+
     def clear_cache(self) -> None:
-        """Clear the entire cache"""
+        """Clear the entire cache."""
         self._cache.clear()
-    
-    def remove_from_cache(self, chat_id: int) -> None:
-        """Remove specific chat from cache"""
+        self._alias_map.clear()
+
+    def drop_cache_entry(self, chat_id: int) -> None:
+        """Remove a chat from the in-memory cache only."""
         self._cache.pop(chat_id, None)
-        self._invalid_chats.pop(chat_id, None)
-    
-    async def cleanup_invalid_chats(self, bot) -> List[int]:
-        """Clean up invalid chats and return list of removed chat IDs"""
-        from database.repository import Repository
-        
-        removed_chats = []
-        
-        for chat_id, error_info in self._invalid_chats.copy().items():
-            error_type = error_info.get('error_type', '')
-            
-            # Auto-remove chats that are clearly invalid
-            if error_type in ['upgraded', 'not_found', 'forbidden']:
-                try:
-                    await Repository.remove_target_chat(chat_id)
-                    removed_chats.append(chat_id)
-                    self.remove_from_cache(chat_id)
-                    from loguru import logger
-                    logger.info(f"Auto-removed invalid chat {chat_id} (reason: {error_type})")
-                except Exception as e:
-                    from loguru import logger
-                    logger.error(f"Error removing invalid chat {chat_id}: {e}")
-        
-        return removed_chats
+        aliases = [alias for alias, mapped in self._alias_map.items() if mapped == chat_id]
+        for alias in aliases:
+            self._alias_map.pop(alias, None)
+
+    async def remove_from_cache(self, chat_id: int) -> None:
+        """Remove specific chat from cache and persistent invalid list."""
+        self._cache.pop(chat_id, None)
+        aliases = [alias for alias, mapped in self._alias_map.items() if mapped == chat_id]
+        for alias in aliases:
+            self._alias_map.pop(alias, None)
+        await self._clear_invalid_chat(chat_id)
+
+    async def cleanup_invalid_chats(self, _bot) -> List[int]:
+        """Return chats whose retry window elapsed for potential revalidation."""
+        await self.initialize()
+        now = datetime.now().timestamp()
+        return [
+            chat_id
+            for chat_id, entry in self._invalid_chats.items()
+            if entry.next_retry_at is not None and now >= entry.next_retry_at
+        ]
